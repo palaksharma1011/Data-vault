@@ -7,24 +7,30 @@ import (
 	"net/http"
 	"os"
 	"time"
+	"github.com/joho/godotenv"
 )
 
 //go:embed web
 var webFS embed.FS
 
 func main() {
+
+	if err := godotenv.Load(); err != nil {
+        log.Println("No .env file found; using system environment variables")
+    }
 	dataDir := os.Getenv("VAULT_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
-	}
+    if dataDir == "" {
+        dataDir = "./data"
+    }
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgresql://postgres:palakSH16*@localhost:5432/Data-Vault"
-	}
-	store, err := NewStore(dataDir, dsn)
-	if err != nil {
-		log.Fatalf("failed to open store: %v", err)
-	}
+    if dsn == "" {
+        log.Fatal("DATABASE_URL is required")
+    }
+
+    store, err := NewStore(dataDir, dsn)
+    if err != nil {
+        log.Fatalf("failed to open store: %v", err)
+    }
 	defer store.Close()
 	km, err := NewKeyManager(dataDir)
 	if err != nil {

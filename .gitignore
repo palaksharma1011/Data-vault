@@ -1,0 +1,13 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+bin/
+dist/
+
+# data
+/backend/data/
+/backend/dist/
+/backend/.env

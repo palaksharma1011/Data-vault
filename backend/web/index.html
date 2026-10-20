@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Data-Centric Zero-Trust Secure Data Vault</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <div class="brand-badge">🔒 Zero-Trust Vault</div>
+    <h1>Sign in</h1>
+    <p class="sub">Data-Centric Zero-Trust Secure Data Vault — Version 1</p>
+    <div id="login-step-password">
+      <input id="login-username" placeholder="Username" autocomplete="username" />
+      <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" />
+      <div class="error-msg" id="login-error"></div>
+      <button id="login-btn" style="width:100%">Sign in</button>
+      <div class="hint">First run default: <b>admin</b> / <b>Admin@123</b> (see server log) — enrol MFA right after signing in.</div>
+    </div>
+    <div id="login-step-mfa" class="hidden">
+      <p class="sub" style="margin-top:0">Enter the 6-digit code from your authenticator app, or one of your recovery codes.</p>
+      <input id="login-mfa-code" placeholder="123456 or abcde-fghjk" autocomplete="one-time-code" inputmode="text" />
+      <div class="error-msg" id="login-mfa-error"></div>
+      <button id="login-mfa-btn" style="width:100%">Verify</button>
+      <button class="secondary" id="login-mfa-back" style="width:100%;margin-top:8px">Back</button>
+    </div>
+  </div>
+</div>
+
+<div id="app-screen" class="hidden">
+  <div class="sidebar">
+    <div class="brand">🔒 Zero-Trust Vault</div>
+    <div class="brand-sub">Secure Data Vault v1</div>
+    <div id="nav"></div>
+    <div class="who">
+      Signed in as<br/>
+      <b id="who-name"></b> <span class="tag role" id="who-role"></span><br/>
+      <button class="secondary" id="logout-btn" style="margin-top:10px;width:100%">Log out</button>
+    </div>
+  </div>
+  <main id="main-content"></main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

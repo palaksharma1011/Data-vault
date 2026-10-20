@@ -1,0 +1,10 @@
+.env
+.env.*
+data/
+*.key
+*.enc
+*_test.go
+.git
+.gitignore
+Dockerfile
+.dockerignore

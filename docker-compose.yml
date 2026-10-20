@@ -1,37 +1,48 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: vault
-      POSTGRES_USER: vault
-      POSTGRES_PASSWORD: vault_password   # change for anything real
+      POSTGRES_DB: ${POSTGRES_DB:-vault}
+      POSTGRES_USER: ${POSTGRES_USER:-vault}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pg-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # No "ports:" on purpose: the DB is only reachable by the vault
+    # container over the internal network, not from your host or LAN.
+    networks: [backend]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vault -d vault"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 3s
       timeout: 3s
       retries: 20
 
   vault:
     build: ./backend
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
-      - vault-data:/app/data   # encrypted file blobs + master key
+      - vault-data:/app/data          # encrypted file blobs
     environment:
-      DATABASE_URL: postgres://vault:vault_password@postgres:5432/vault?sslmode=disable
-      # Optional hardening / settings (see README):
-      # VAULT_REQUIRE_MFA: "true"          # force every user to enrol MFA
-      # VAULT_HIDE_UNAUTHORIZED: "true"    # hide files a role has no policy for
-      # VAULT_ADMIN_PASSWORD: "change-me-12345"   # first-run admin password
-      # VAULT_MAX_UPLOAD_MB: "200"
-      # VAULT_MASTER_KEY: ""               # base64 32-byte key (use a secret manager)
+      DATABASE_URL: postgres://${POSTGRES_USER:-vault}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-vault}?sslmode=disable
+      VAULT_MASTER_KEY: ${VAULT_MASTER_KEY:?set VAULT_MASTER_KEY in .env}
+      VAULT_ADMIN_PASSWORD: ${VAULT_ADMIN_PASSWORD:?set VAULT_ADMIN_PASSWORD in .env}
+      VAULT_REQUIRE_MFA: ${VAULT_REQUIRE_MFA:-false}
+      VAULT_HIDE_UNAUTHORIZED: ${VAULT_HIDE_UNAUTHORIZED:-false}
+      VAULT_MAX_UPLOAD_MB: ${VAULT_MAX_UPLOAD_MB:-200}
+    networks: [backend]
+    # Hardening
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  backend:
 
 volumes:
   vault-data:

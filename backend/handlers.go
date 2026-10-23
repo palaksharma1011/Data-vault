@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +21,15 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	// NEW: replace YOUR_MODULE with the module name on the first line of go.mod
+	"vault/validator"
 )
+
+// EventUploadRejected is the audit action written when the upload validator
+// refuses a file. (Move this next to your other Event* constants in audit.go
+// if you prefer to keep them together.)
+const EventUploadRejected Action = "UPLOAD_REJECTED"
 
 // Config holds runtime options (all from environment variables).
 type Config struct {
@@ -28,6 +38,10 @@ type Config struct {
 	TrustProxy       bool   // VAULT_TRUST_PROXY: honour X-Forwarded-For for rate limiting
 	MaxUploadBytes   int64  // VAULT_MAX_UPLOAD_MB
 	MFAIssuer        string // VAULT_MFA_ISSUER
+
+	// NEW: upload validation
+	QuarantineDir string // VAULT_QUARANTINE_DIR: private folder where uploads sit while being checked
+	ClamAVAddr    string // VAULT_CLAMAV_ADDR: host:port of clamd (e.g. clamav:3310); empty = malware scan disabled
 }
 
 func envBool(name string) bool {
@@ -50,6 +64,8 @@ func LoadConfig() Config {
 		TrustProxy:       envBool("VAULT_TRUST_PROXY"),
 		MaxUploadBytes:   mb << 20,
 		MFAIssuer:        issuer,
+		QuarantineDir:    strings.TrimSpace(os.Getenv("VAULT_QUARANTINE_DIR")),
+		ClamAVAddr:       strings.TrimSpace(os.Getenv("VAULT_CLAMAV_ADDR")),
 	}
 }
 
@@ -63,15 +79,56 @@ type App struct {
 	ipLim   *FailureLimiter // failed logins per client IP
 
 	requireMFA bool
+
+	fileValidator *validator.Validator // NEW: checks every upload before encryption
 }
 
 func NewApp(store *Store, km *KeyManager, cfg Config) *App {
+	if cfg.QuarantineDir == "" {
+		cfg.QuarantineDir = filepath.Join(os.TempDir(), "vault-quarantine")
+	}
 	return &App{
 		store: store, km: km, cfg: cfg,
-		sessions:   NewSessionStore(),
-		userLim:    NewFailureLimiter(5, 15*time.Minute, 15*time.Minute, time.Hour),
-		ipLim:      NewFailureLimiter(20, 15*time.Minute, 15*time.Minute, time.Hour),
-		requireMFA: cfg.RequireMFA,
+		sessions:      NewSessionStore(),
+		userLim:       NewFailureLimiter(5, 15*time.Minute, 15*time.Minute, time.Hour),
+		ipLim:         NewFailureLimiter(20, 15*time.Minute, 15*time.Minute, time.Hour),
+		requireMFA:    cfg.RequireMFA,
+		fileValidator: newFileValidator(cfg),
+	}
+}
+
+// newFileValidator prepares the quarantine folder and builds the validator.
+func newFileValidator(cfg Config) *validator.Validator {
+	if err := os.MkdirAll(cfg.QuarantineDir, 0o700); err != nil {
+		log.Fatalf("cannot create quarantine dir %q: %v", cfg.QuarantineDir, err)
+	}
+	purgeQuarantine(cfg.QuarantineDir, time.Hour) // leftovers from a crash
+
+	v := &validator.Validator{MaxSize: cfg.MaxUploadBytes}
+	if cfg.ClamAVAddr != "" {
+		v.Scanner = &validator.ClamAV{Network: "tcp", Addr: cfg.ClamAVAddr, Timeout: 3 * time.Minute}
+	} else {
+		log.Printf("WARNING: VAULT_CLAMAV_ADDR is not set - malware scanning is DISABLED (type/corruption checks still run)")
+	}
+	return v
+}
+
+func purgeQuarantine(dir string, olderThan time.Duration) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if time.Since(info.ModTime()) > olderThan {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
 	}
 }
 
@@ -393,8 +450,8 @@ func safeFileName(n string) string {
 	return n
 }
 
-// handleUploadFile streams the upload straight into encryption: the
-// plaintext is never written to disk and never fully held in memory.
+// handleUploadFile reads the multipart upload and hands the file to
+// storeUpload, which quarantines it, validates it, and only then encrypts it.
 // The multipart "classification" field must come BEFORE the "file" field.
 func (a *App) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.requireRole(w, r, RoleAdmin)
@@ -428,7 +485,7 @@ func (a *App) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, "a valid classification field must be sent before the file field")
 				return
 			}
-			a.storeUpload(w, p, class, safeFileName(part.FileName()), part)
+			a.storeUpload(w, r, p, class, safeFileName(part.FileName()), part)
 			return
 		}
 	}
@@ -443,7 +500,65 @@ func (a *App) uploadReadError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusBadRequest, "failed to read upload")
 }
 
-func (a *App) storeUpload(w http.ResponseWriter, p *Principal, class Classification, name string, src io.Reader) {
+// storeUpload is the secure upload pipeline:
+//
+//	1. QUARANTINE : copy the upload to a private temp file (0600, deleted at the end)
+//	2. VALIDATE   : size, extension, real type, corruption, active content, ClamAV
+//	                -> rejected? audit UPLOAD_REJECTED, delete temp file, stop.
+//	3. ENCRYPT    : only a validated file is encrypted (and re-hashed while reading,
+//	                so we know the bytes encrypted are the bytes that were checked)
+//	4. AUDIT+SAVE : audit FILE_UPLOAD (with type + sha256), then write metadata
+func (a *App) storeUpload(w http.ResponseWriter, r *http.Request, p *Principal, class Classification, name string, src io.Reader) {
+	// ---- 1. QUARANTINE ----
+	q, err := os.CreateTemp(a.cfg.QuarantineDir, "q-*") // created with mode 0600
+	if err != nil {
+		log.Printf("quarantine create failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to create quarantine file")
+		return
+	}
+	qPath := q.Name()
+	defer os.Remove(qPath) // plaintext never outlives this request
+	if _, err := io.Copy(q, src); err != nil {
+		q.Close()
+		a.uploadReadError(w, err)
+		return
+	}
+	if err := q.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to write quarantine file")
+		return
+	}
+
+	// ---- 2. VALIDATE ----
+	vres, err := a.fileValidator.Validate(r.Context(), qPath, name)
+	if err != nil {
+		var rej *validator.RejectError
+		if errors.As(err, &rej) {
+			// The file itself is bad: audit the denial and refuse.
+			reason := cleanText(fmt.Sprintf("upload of %q rejected: %s - %s", name, rej.Code, rej.Reason), 300)
+			a.auditBestEffort(p.User, "", name, EventUploadRejected, DecisionDeny, reason)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error":  "file rejected by security validation",
+				"code":   rej.Code,
+				"reason": cleanText(rej.Reason, 200),
+			})
+			return
+		}
+		// Scanner down / I/O problem: FAIL CLOSED - the file is not accepted.
+		log.Printf("upload validation unavailable for %q: %v", name, err)
+		a.auditBestEffort(p.User, "", name, EventUploadRejected, DecisionDeny,
+			cleanText(fmt.Sprintf("upload of %q refused: validation unavailable (%v)", name, err), 300))
+		writeError(w, http.StatusServiceUnavailable, "file could not be verified - upload refused, try again later")
+		return
+	}
+
+	// ---- 3. ENCRYPT (only reached when the file passed every check) ----
+	in, err := os.Open(qPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read quarantine file")
+		return
+	}
+	defer in.Close()
+
 	id := newID("file")
 	encPath := filepath.Join(a.store.FilesDir(), id+".enc")
 	f, err := os.OpenFile(encPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -453,7 +568,8 @@ func (a *App) storeUpload(w http.ResponseWriter, p *Principal, class Classificat
 	}
 	cleanup := func() { f.Close(); os.Remove(encPath) }
 	bw := bufio.NewWriterSize(f, 256<<10)
-	size, wrapped, err := EncryptStream(a.km, bw, src, id, class)
+	h := sha256.New()
+	size, wrapped, err := EncryptStream(a.km, bw, io.TeeReader(in, h), id, class)
 	if err == nil {
 		err = bw.Flush()
 	}
@@ -462,7 +578,16 @@ func (a *App) storeUpload(w http.ResponseWriter, p *Principal, class Classificat
 	}
 	if err != nil {
 		cleanup()
-		a.uploadReadError(w, err)
+		log.Printf("encryption of %s failed: %v", id, err)
+		writeError(w, http.StatusInternalServerError, "failed to encrypt file")
+		return
+	}
+	// Make sure the bytes we encrypted are exactly the bytes we validated.
+	if hex.EncodeToString(h.Sum(nil)) != vres.SHA256 {
+		cleanup()
+		a.auditBestEffort(p.User, "", name, EventUploadRejected, DecisionDeny,
+			cleanText(fmt.Sprintf("upload of %q refused: file changed after validation", name), 300))
+		writeError(w, http.StatusInternalServerError, "file changed during processing - upload refused")
 		return
 	}
 	if err := f.Close(); err != nil {
@@ -470,12 +595,15 @@ func (a *App) storeUpload(w http.ResponseWriter, p *Principal, class Classificat
 		writeError(w, http.StatusInternalServerError, "failed to persist encrypted file")
 		return
 	}
+
+	// ---- 4. AUDIT + SAVE ----
 	res := &FileResource{
 		ID: id, Name: name, Classification: class, OwnerID: p.User.ID, EncPath: encPath,
 		WrappedKey: wrapped, EncVersion: 2, Size: size, UploadedAt: time.Now(),
 	}
 	if !a.audit(w, p.User, id, name, EventFileUpload, DecisionAllow,
-		fmt.Sprintf("uploaded %q (%d bytes) classified %s", name, size, class)) {
+		fmt.Sprintf("uploaded %q (%d bytes) classified %s; validated as %s, sha256=%s",
+			name, size, class, vres.Kind, vres.SHA256)) {
 		os.Remove(encPath)
 		return
 	}

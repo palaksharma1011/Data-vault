@@ -58,6 +58,7 @@ func main() {
 	}
 	log.Printf("Data-Centric Zero-Trust Secure Data Vault listening on %s (require-mfa=%v, hide-unauthorized=%v, max-upload=%dMB)",
 		addr, cfg.RequireMFA, cfg.HideUnauthorized, cfg.MaxUploadBytes>>20)
+		log.Printf("malware scanning: %v (clamav=%q, quarantine=%q)", cfg.ClamAVAddr != "", cfg.ClamAVAddr, cfg.QuarantineDir)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -159,19 +160,3 @@ func bootstrapAdmin(store *Store) {
 	log.Println("=====================================================")
 }
 
-var fileValidator *validator.Validator
-
-func initValidator() {
-	maxMB, _ := strconv.Atoi(os.Getenv("MAX_UPLOAD_MB"))
-	if maxMB == 0 {
-		maxMB = 25
-	}
-	qdir := os.Getenv("QUARANTINE_DIR")
-	if err := os.MkdirAll(qdir, 0o700); err != nil {
-		log.Fatal(err)
-	}
-	fileValidator = &validator.Validator{
-		MaxSize: int64(maxMB) << 20,
-		Scanner: &validator.ClamAV{Network: "tcp", Addr: os.Getenv("CLAMAV_ADDR"), Timeout: 30 * time.Second},
-	}
-}
